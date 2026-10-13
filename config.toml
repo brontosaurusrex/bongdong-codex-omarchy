@@ -1,0 +1,5 @@
+# Popup and sound only after MORE than this many seconds of activity.
+min_seconds = 30
+
+sound_enabled = true
+sound_dir = "~/.local/share/codex-notify/sounds"

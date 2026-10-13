@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+package_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+luac -p "$package_dir/hypr/codex-border.lua"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$package_dir/tests" -v

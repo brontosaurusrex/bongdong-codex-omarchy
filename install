@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Install Codex borders, notifications, and sounds into the current user's home."""
+
+import argparse
+import ast
+from datetime import datetime
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+
+PACKAGE = Path(__file__).resolve().parent
+BORDER_REQUIRE = 'require("hypr.codex-border")'
+
+
+def existing(path):
+    return path.read_text() if path.exists() else ''
+
+
+def ensure_require(text, module):
+    pattern = r'(?m)^\s*require\s*\(?\s*["\']' + re.escape(module) + r'["\']'
+    if re.search(pattern, text):
+        return text
+    return text.rstrip() + '\nrequire(' + json.dumps(module) + ')\n'
+
+
+def migrate_border(text, border):
+    # Replace only the exact original block; preserve all personal animations.
+    original = border.rstrip()
+    if original in text:
+        text = text.replace(original, BORDER_REQUIRE, 1)
+    elif 'codex_working_rules' in text or '+codex-working-' in text:
+        raise ValueError('mine.lua contains a customized Codex border. Move that rule into codex-border.lua before installing.')
+    return ensure_require(text, 'hypr.codex-border')
+
+
+def startup_entry(text, script):
+    command = shlex.join([sys.executable, str(script), '--start-watcher'])
+    entry = 'o.exec_on_start(' + json.dumps(command, ensure_ascii=False) + ')'
+    lines = text.splitlines()
+    matched = False
+    result = []
+    for line in lines:
+        if (re.match(r'^\s*o\.(exec_on_start|launch_on_start)\s*\(', line)
+                and 'codex-notify.py' in line and '--start-watcher' in line):
+            if not matched:
+                result.append(entry)
+                matched = True
+        else:
+            result.append(line)
+    if not matched:
+        result.extend(['', '-- Start Codex activity notifications at desktop login.', entry])
+    return '\n'.join(result) + '\n'
+
+
+def settings_text(text, home):
+    settings = tomllib.loads(text)
+    defaults = tomllib.loads((PACKAGE / 'config.toml').read_text())
+    defaults['sound_dir'] = str(home / '.local/share/codex-notify/sounds')
+    additions = [f'{key} = {json.dumps(value, ensure_ascii=False)}'
+                 for key, value in defaults.items() if key not in settings]
+    if additions:
+        text = '# Codex feedback settings.\n' + '\n'.join(additions) + '\n\n' + text
+    settings = tomllib.loads(text)
+    seconds = settings['min_seconds']
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
+        raise ValueError('min_seconds must be a nonnegative number')
+    if not isinstance(settings['sound_enabled'], bool):
+        raise ValueError('sound_enabled must be true or false')
+    if not isinstance(settings['sound_dir'], str) or not settings['sound_dir']:
+        raise ValueError('sound_dir must be a nonempty path')
+    path = settings['sound_dir']
+    sounds = home / path[2:] if path.startswith('~/') else Path(path).expanduser()
+    if not sounds.is_absolute():
+        raise ValueError('sound_dir must be an absolute path or start with ~/')
+    return text, sounds
+
+
+def make_plan(home):
+    hypr = home / '.config/hypr'
+    main = hypr / 'hyprland.lua'
+    if not main.is_file():
+        raise ValueError('Expected ~/.config/hypr/hyprland.lua; this installer requires Lua-based Omarchy.')
+    script = home / 'bin/codex-notify.py'
+    border = (PACKAGE / 'hypr/codex-border.lua').read_text()
+    config = home / '.config/codex-notify/config.toml'
+    settings, sounds = settings_text(existing(config), home)
+    main_text = ensure_require(existing(main), 'hypr.autostart')
+    main_text = ensure_require(main_text, 'hypr.mine')
+    plan = {
+        script: ((PACKAGE / 'codex-notify.py').read_bytes(), 0o755),
+        hypr / 'codex-border.lua': (border.encode(), 0o644),
+        hypr / 'mine.lua': (migrate_border(existing(hypr / 'mine.lua'), border).encode(), 0o644),
+        main: (main_text.encode(), 0o644),
+        hypr / 'autostart.lua': (startup_entry(existing(hypr / 'autostart.lua'), script).encode(), 0o644),
+        config: (settings.encode(), 0o644),
+    }
+    for sound in sorted((PACKAGE / 'sounds').iterdir()):
+        if sound.is_file() and not (sounds / sound.name).exists():
+            plan[sounds / sound.name] = (sound.read_bytes(), 0o644)
+    return plan
+
+
+def validate(plan):
+    missing = [name for name in ('hyprctl', 'notify-send', 'mpv', 'luac') if shutil.which(name) is None]
+    if missing:
+        raise ValueError('Missing required commands: ' + ', '.join(missing))
+    ast.parse((PACKAGE / 'codex-notify.py').read_text())
+    with tempfile.TemporaryDirectory(prefix='codex-feedback-lua-') as directory:
+        for path, (content, _) in plan.items():
+            if path.suffix == '.lua':
+                candidate = Path(directory) / path.name
+                candidate.write_bytes(content)
+                subprocess.run(['luac', '-p', str(candidate)], check=True)
+
+
+def atomic_write(path, content, mode):
+    # Preserve dotfile symlinks by replacing their resolved target.
+    destination = path.resolve() if path.is_symlink() else path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(content)
+        temporary.chmod(mode)
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def write_plan(plan, home):
+    changed = {path: value for path, value in plan.items()
+               if not path.exists() or path.read_bytes() != value[0]
+               or (path.stat().st_mode & 0o777) != value[1]}
+    if not changed:
+        return None, {}
+    backup = home / '.cache/codex-notify/backups' / (datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + str(time.time_ns()))
+    backup.mkdir(parents=True, mode=0o700)
+    originals = {}
+    for path in changed:
+        if path.exists():
+            originals[path] = (path.read_bytes(), path.stat().st_mode & 0o777)
+            relative = path.relative_to(home) if path.is_relative_to(home) else Path('external') / path.name
+            archived = backup / relative
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, archived)
+        else:
+            originals[path] = None
+    written = {}
+    try:
+        for path, (content, mode) in changed.items():
+            atomic_write(path, content, mode)
+            written[path] = originals[path]
+    except Exception:
+        restore(written)
+        raise
+    return backup, originals
+
+
+def restore(originals):
+    for path, original in originals.items():
+        if original is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_write(path, *original)
+
+
+def restart_watcher(script):
+    pattern = r'(^| )' + re.escape(str(script)) + r' --watch$'
+    subprocess.run(['pkill', '-u', str(os.getuid()), '-f', pattern], check=False)
+    for _ in range(30):
+        result = subprocess.run(['pgrep', '-u', str(os.getuid()), '-f', pattern],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 1:
+            subprocess.run([sys.executable, str(script), '--start-watcher'], check=True)
+            return
+        if result.returncode != 0:
+            raise RuntimeError('Unable to check the old watcher process.')
+        time.sleep(0.1)
+    raise RuntimeError('The previous watcher did not stop; restart it manually.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true', help='preview files without changing anything')
+    parser.add_argument('--no-reload', action='store_true', help='install for the next desktop login')
+    parser.add_argument('--home', type=Path, default=Path.home(), help='target home directory (implies --no-reload when different)')
+    args = parser.parse_args()
+    home = args.home.expanduser().resolve()
+    plan = make_plan(home)
+    validate(plan)
+    if args.dry_run:
+        for path, (content, _) in plan.items():
+            status = 'keep' if path.exists() and path.read_bytes() == content else 'install/update'
+            print(f'{status}: {path}')
+        return 0
+    backup, originals = write_plan(plan, home)
+    if backup:
+        print(f'Backup: {backup}')
+    live = not args.no_reload and home == Path.home().resolve() and os.environ.get('HYPRLAND_INSTANCE_SIGNATURE')
+    if live:
+        try:
+            subprocess.run(['hyprctl', 'reload'], check=True, capture_output=True, text=True, timeout=10)
+            errors = subprocess.check_output(['hyprctl', 'configerrors'], text=True, timeout=10).strip()
+            if errors:
+                raise RuntimeError('Hyprland configuration errors: ' + errors)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            restore(originals)
+            subprocess.run(['hyprctl', 'reload'], check=False, capture_output=True, timeout=10)
+            raise
+        restart_watcher(home / 'bin/codex-notify.py')
+        print('Installed. Hyprland reloaded and the watcher restarted.')
+    else:
+        print('Installed. The watcher will start at your next Hyprland login.')
+    print(f'Settings: {home / ".config/codex-notify/config.toml"}')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'Install failed: {error}', file=sys.stderr)
+        sys.exit(1)
